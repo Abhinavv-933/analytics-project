@@ -1,0 +1,45 @@
+version: "3.8"
+services:
+  mongo:
+    image: mongo:6
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  ingestion:
+    build: ./services/ingestion
+    environment:
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3001:3001"
+    depends_on:
+      - redis
+
+  processor:
+    build: ./services/processor
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - MONGO_URL=mongodb://mongo:27017/analytics
+    depends_on:
+      - redis
+      - mongo
+
+  reporting:
+    build: ./services/reporting
+    environment:
+      - MONGO_URL=mongodb://mongo:27017/analytics
+    ports:
+      - "3002:3002"
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:
