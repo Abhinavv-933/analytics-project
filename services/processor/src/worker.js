@@ -1,89 +1,87 @@
-const { createClient } = require('redis');
-const { MongoClient } = require('mongodb');
+while (true) {
+  try {
+    // BRPOP blocks until an element is available
+    const res = await redis.brPop(QUEUE_NAME, 0);
+    if (!res) continue;
 
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
-const MONGO_URL = process.env.MONGO_URL || 'mongodb://localhost:27017/analytics';
-const QUEUE_NAME = 'events_queue';
+    const payload = res.element || res[1];
+    if (!payload) continue;
 
-async function isoDate(dateStr) {
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10); // YYYY-MM-DD
-}
+    const event = JSON.parse(payload);
 
-async function main() {
-  // Redis
-  const redis = createClient({ url: REDIS_URL });
-  redis.on('error', (e) => console.error('Redis error', e));
-  await redis.connect();
+    console.log("\n========================================");
+    console.log("📥 New Event Received");
+    console.log(`🆔 Event ID   : ${event.id}`);
+    console.log(`🌐 Site       : ${event.site_id}`);
+    console.log(`📌 Type       : ${event.event_type}`);
+    console.log(`📄 Path       : ${event.path || "/"}`);
+    console.log(`👤 User       : ${event.user_id || "Anonymous"}`);
+    console.log(`⏰ Timestamp  : ${event.timestamp}`);
 
-  // Mongo
-  const mongoClient = new MongoClient(MONGO_URL);
-  await mongoClient.connect();
-  const db = mongoClient.db(); // analytics
-  const eventsCol = db.collection('events');
-  const statsCol = db.collection('stats');
-  const uniqueUsersCol = db.collection('unique_users');
+    // Convert timestamp to YYYY-MM-DD
+    const date = await isoDate(event.timestamp || new Date().toISOString());
+    const pathKey = (event.path || "/").toString();
 
-  // Create indexes
-  await eventsCol.createIndex({ site_id: 1, timestamp: 1 });
-  await uniqueUsersCol.createIndex({ site_id: 1, date: 1, user_id: 1 }, { unique: true, background: true });
+    // Store raw event
+    await eventsCol.insertOne({
+      event_id: event.id,
+      site_id: event.site_id,
+      event_type: event.event_type,
+      path: event.path || "/",
+      user_id: event.user_id || null,
+      timestamp: event.timestamp,
+      date
+    });
 
-  console.log('Processor connected to Redis and MongoDB. Waiting for events...');
+    console.log("✅ Raw event stored in MongoDB");
 
-  while (true) {
-    try {
-      // BRPOP blocks until an element is available; returns [queue, item]
-      const res = await redis.brPop(QUEUE_NAME, 0);
-      if (!res) continue;
-      const payload = res.element || res[1] || null;
-      if (!payload) continue;
+    // Update analytics
+    await statsCol.updateOne(
+      { site_id: event.site_id, date },
+      {
+        $inc: {
+          total_views: 1,
+          [`paths.${pathKey}`]: 1
+        }
+      },
+      { upsert: true }
+    );
 
-      const event = JSON.parse(payload);
-      // Basic validation/correction
-      const date = await isoDate(event.timestamp || new Date().toISOString());
-      const pathKey = (event.path || '/').toString();
+    console.log("📊 Analytics updated");
 
-      // 1) Write raw event to events collection
-      await eventsCol.insertOne({
-        event_id: event.id,
-        site_id: event.site_id,
-        event_type: event.event_type,
-        path: event.path || '/',
-        user_id: event.user_id || null,
-        timestamp: event.timestamp,
-        date
-      });
+    // Unique users
+    if (event.user_id) {
+      try {
+        await uniqueUsersCol.updateOne(
+          {
+            site_id: event.site_id,
+            date,
+            user_id: event.user_id
+          },
+          {
+            $setOnInsert: {
+              site_id: event.site_id,
+              date,
+              user_id: event.user_id,
+              first_seen: new Date().toISOString()
+            }
+          },
+          { upsert: true }
+        );
 
-      // 2) Update stats (increment total_views and path count)
-      const statFilter = { site_id: event.site_id, date };
-      const statUpdate = {
-        $inc: { total_views: 1, [`paths.${pathKey}`]: 1 }
-      };
-      await statsCol.updateOne(statFilter, statUpdate, { upsert: true });
-
-      // 3) Record unique user if user_id present
-      if (event.user_id) {
-        try {
-          await uniqueUsersCol.updateOne(
-            { site_id: event.site_id, date, user_id: event.user_id },
-            { $setOnInsert: { site_id: event.site_id, date, user_id: event.user_id, first_seen: new Date().toISOString() } },
-            { upsert: true }
-          );
-        } catch (err) {
-          // ignore duplicate key errors or other transient
-          if (err.code !== 11000) console.error('unique user upsert error', err);
+        console.log("👤 Unique user recorded");
+      } catch (err) {
+        if (err.code !== 11000) {
+          console.error("Unique user update failed:", err);
         }
       }
-    } catch (err) {
-      console.error('Processor loop error', err);
-      // brief sleep before retrying on unexpected error to avoid tight crash loops
-      await new Promise((r) => setTimeout(r, 500));
     }
+
+    console.log("🎉 Event processed successfully");
+    console.log("========================================\n");
+
+  } catch (err) {
+    console.error("❌ Processor loop error:", err);
+    await new Promise((r) => setTimeout(r, 500));
   }
 }
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
